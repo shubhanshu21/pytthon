@@ -25,9 +25,175 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 import smtplib
 from typing import Dict, Any
+import pytz
+from scalping_stocks_finder import get_best_scalping_stocks
 
 # Load environment variables
 load_dotenv()
+
+class TradingFees:
+    """
+    Class to calculate all trading fees for Indian markets including:
+    - Brokerage
+    - STT (Securities Transaction Tax)
+    - Exchange Transaction Charges
+    - GST
+    - SEBI Turnover Fee
+    - Stamp Duty
+    """
+    def __init__(self, broker_type="discount"):
+        """
+        Initialize with broker type
+        
+        Args:
+            broker_type: "discount" or "full_service"
+        """
+        # Set fee structure based on broker type
+        if broker_type == "discount":
+            # Flat fee (Zerodha-like)
+            self.brokerage_buy = 20  # Flat fee per executed order
+            self.brokerage_sell = 20  # Flat fee per executed order
+            self.brokerage_percent = 0.0  # No percentage brokerage
+            self.brokerage_cap = 20  # Maximum brokerage per order
+        else:
+            # Traditional broker
+            self.brokerage_buy = 0.0
+            self.brokerage_sell = 0.0
+            self.brokerage_percent = 0.03  # 0.03% brokerage
+            self.brokerage_cap = 0  # No cap
+        
+        # Standard regulatory charges
+        self.stt_buy = 0.00025  # 0.025% STT on buy (delivery)
+        self.stt_sell = 0.00025  # 0.025% STT on sell (delivery)
+        self.stt_intraday = 0.0001  # 0.01% STT on sell side for intraday
+        self.exchange_txn_charge = 0.0000325  # 0.00325% exchange transaction charge
+        self.gst = 0.18  # 18% GST on brokerage and exchange transaction charges
+        self.sebi_charges = 0.0000001  # SEBI turnover fee 0.00001%
+        self.stamp_duty = 0.00002  # 0.002% stamp duty (varies by state, taking average)
+    
+    def calculate_total_charges(self, trade_value, trade_type="INTRADAY"):
+        """
+        Calculate all charges for a trade
+        
+        Args:
+            trade_value: Total value of the trade (price * quantity)
+            trade_type: "INTRADAY" or "DELIVERY"
+            
+        Returns:
+            Dictionary with all charges
+        """
+        # Initialize charges
+        charges = {
+            "brokerage": 0,
+            "stt": 0,
+            "exchange_charges": 0,
+            "gst": 0,
+            "sebi_charges": 0,
+            "stamp_duty": 0,
+            "total_charges": 0
+        }
+        
+        # Calculate brokerage
+        if self.brokerage_percent > 0:
+            # Percentage brokerage
+            brokerage = trade_value * self.brokerage_percent
+            if self.brokerage_cap > 0:
+                brokerage = min(brokerage, self.brokerage_cap)
+            charges["brokerage"] = brokerage
+        else:
+            # Flat brokerage
+            charges["brokerage"] = self.brokerage_buy  # Same as brokerage_sell for flat
+        
+        # Calculate STT based on trade type
+        if trade_type == "INTRADAY":
+            charges["stt"] = trade_value * self.stt_intraday
+        else:  # DELIVERY
+            charges["stt"] = trade_value * self.stt_sell  # Both buy and sell have same STT for delivery
+        
+        # Exchange transaction charges
+        charges["exchange_charges"] = trade_value * self.exchange_txn_charge
+        
+        # GST on brokerage and exchange charges
+        charges["gst"] = (charges["brokerage"] + charges["exchange_charges"]) * self.gst
+        
+        # SEBI charges
+        charges["sebi_charges"] = trade_value * self.sebi_charges
+        
+        # Stamp duty
+        charges["stamp_duty"] = trade_value * self.stamp_duty
+        
+        # Total charges
+        charges["total_charges"] = sum(charges.values())
+        
+        return charges
+    
+    def calculate_breakeven(self, entry_price, quantity, trade_type="INTRADAY"):
+        """
+        Calculate breakeven price considering all fees
+        
+        Args:
+            entry_price: Entry price per share
+            quantity: Number of shares traded
+            trade_type: "INTRADAY" or "DELIVERY"
+            
+        Returns:
+            Breakeven price per share
+        """
+        entry_value = entry_price * quantity
+        
+        # Calculate charges for both entry and exit
+        entry_charges = self.calculate_total_charges(entry_value, trade_type)
+        exit_charges = self.calculate_total_charges(entry_value, trade_type)  # Using same value as estimate
+        
+        # Total cost
+        total_cost = entry_value + entry_charges["total_charges"] + exit_charges["total_charges"]
+        
+        # Breakeven price
+        breakeven_price = total_cost / quantity
+        
+        return breakeven_price
+    
+    def calculate_net_profit(self, entry_price, exit_price, quantity, trade_type="INTRADAY"):
+        """
+        Calculate net profit after all charges
+        
+        Args:
+            entry_price: Entry price per share
+            exit_price: Exit price per share
+            quantity: Number of shares traded
+            trade_type: "INTRADAY" or "DELIVERY"
+            
+        Returns:
+            Dictionary with gross and net P&L details
+        """
+        entry_value = entry_price * quantity
+        exit_value = exit_price * quantity
+        
+        # Gross P&L
+        gross_pnl = exit_value - entry_value
+        
+        # Calculate charges
+        entry_charges = self.calculate_total_charges(entry_value, trade_type)
+        exit_charges = self.calculate_total_charges(exit_value, trade_type)
+        
+        # Total charges
+        total_charges = entry_charges["total_charges"] + exit_charges["total_charges"]
+        
+        # Net P&L
+        net_pnl = gross_pnl - total_charges
+        
+        # Return detailed breakdown
+        return {
+            "entry_value": entry_value,
+            "exit_value": exit_value,
+            "gross_pnl": gross_pnl,
+            "gross_pnl_percent": (gross_pnl / entry_value) * 100 if entry_value > 0 else 0,
+            "total_charges": total_charges,
+            "charges_percent": (total_charges / entry_value) * 100 if entry_value > 0 else 0,
+            "net_pnl": net_pnl,
+            "net_pnl_percent": (net_pnl / entry_value) * 100 if entry_value > 0 else 0
+        }
+
 
 class CustomFeaturesExtractor(BaseFeaturesExtractor):
     def __init__(self, observation_space, features_dim=64):
@@ -179,7 +345,7 @@ def parse_arguments():
     """Parse command line arguments for automated operation"""
     parser = argparse.ArgumentParser(description="AI Stock Trading System")
     parser.add_argument('--autorun', action='store_true', help='Run automated trading without user interaction')
-    parser.add_argument('--symbols', type=str, default='AAPL,MSFT,AMZN,GOOGL,TSLA', help='Comma-separated list of stock symbols')
+    parser.add_argument('--symbols', type=str, default='ABB, ADANIENSOL, ADANIENT', help='Comma-separated list of stock symbols')
     parser.add_argument('--capital', type=float, default=100000.0, help='Initial capital amount')
     parser.add_argument('--interval', type=int, default=5, help='Trading cycle interval in minutes')
     parser.add_argument('--setup-service', action='store_true', help='Generate system service files')
@@ -266,8 +432,16 @@ class StockTradingEnv(gym.Env):
                 'close': [99.0] * 100,
                 'low': [98.0] * 100,
                 'volume': [1000.0] * 100,
+                'rsi':[1000.0] * 100,
+                'atr':[1000.0] * 100,
+                'ma20':[1000.0] * 100,
+                'ma50':[1000.0] * 100,
+                'macd':[1000.0] * 100,
+                'signal':[1000.0] * 100,
+                'vwap':[1000.0] * 100,
+                'obv':[1000.0] * 100
             })
-            self.feature_columns = ['open', 'high', 'low', 'close', 'volume']
+            self.feature_columns = ['open', 'high', 'low', 'close', 'volume', 'rsi', 'atr', 'ma20', 'ma50', 'macd', 'signal', 'vwap', 'obv']
         
         # Action space: Continuous actions [buy_fraction, stop_loss_percent]
         self.action_space = spaces.Box(low=np.array([0.0, 0.0]), high=np.array([1.0, 1.0]), dtype=np.float32)
@@ -621,28 +795,28 @@ class PaperTradingSystem:
             clean_symbol = symbol.split('.')[0]  # Remove .NS or other suffixes
             model_path = f"{self.model_dir}/ppo_{clean_symbol}"
 
-            self.monitor.send_notification(
-                    subject=f"Model loading for Symbol - {symbol}",
-                    message=f"""
-                    <html>
-                      <body style="font-family: Arial, sans-serif; background-color: #f4f4f4; padding: 20px; color: #333;">
-                        <div style="background-color: #ffffff; border-radius: 8px; padding: 20px; max-width: 600px; margin: auto; box-shadow: 0 4px 10px rgba(0, 0, 0, 0.1);">
-                          <div style="font-size: 20px; font-weight: bold; color: #2c3e50; margin-bottom: 10px;">
-                            🔄 Model Loading Notification
-                          </div>
-                          <div style="font-size: 16px; line-height: 1.6;">
-                            <p>Hello,</p>
-                            <p>The model is currently being loaded for the symbol <strong>{symbol}</strong>.</p>
-                            <p>Please wait while we initialize everything.</p>
-                          </div>
-                          <div style="margin-top: 20px; font-size: 13px; color: #888; text-align: center;">
-                            This is an automated message from your Trading Bot.
-                          </div>
-                        </div>
-                      </body>
-                    </html>
-                    """
-                )
+            # self.monitor.send_notification(
+            #         subject=f"Model loading for Symbol - {symbol}",
+            #         message=f"""
+            #         <html>
+            #           <body style="font-family: Arial, sans-serif; background-color: #f4f4f4; padding: 20px; color: #333;">
+            #             <div style="background-color: #ffffff; border-radius: 8px; padding: 20px; max-width: 600px; margin: auto; box-shadow: 0 4px 10px rgba(0, 0, 0, 0.1);">
+            #               <div style="font-size: 20px; font-weight: bold; color: #2c3e50; margin-bottom: 10px;">
+            #                 🔄 Model Loading Notification
+            #               </div>
+            #               <div style="font-size: 16px; line-height: 1.6;">
+            #                 <p>Hello,</p>
+            #                 <p>The model is currently being loaded for the symbol <strong>{symbol}</strong>.</p>
+            #                 <p>Please wait while we initialize everything.</p>
+            #               </div>
+            #               <div style="margin-top: 20px; font-size: 13px; color: #888; text-align: center;">
+            #                 This is an automated message from your Trading Bot.
+            #               </div>
+            #             </div>
+            #           </body>
+            #         </html>
+            #         """
+            #     )
 
             try:
                 if os.path.exists(f"{model_path}.zip"):
@@ -667,7 +841,7 @@ class PaperTradingSystem:
         return np.array([0.0, 0.0])  # No model, no action
     
     def execute_trade(self, symbol, action):
-        """Execute paper trade based on model action"""
+        """Execute paper trade based on model action with realistic fees"""
         # Get latest price
         current_price = self.data_handler.get_latest_price(symbol)
         if current_price is None:
@@ -681,6 +855,9 @@ class PaperTradingSystem:
         # Current position value
         position_value = self.positions[symbol] * current_price
         
+        # Initialize fee calculator
+        fee_calculator = TradingFees(broker_type="discount")  # Use discount broker like Zerodha
+        
         # Log action consideration
         print(f"Considering action for {symbol}: Buy Fraction={buy_fraction:.2f}, Stop Loss={stop_loss_percent:.2f}")
         
@@ -688,21 +865,46 @@ class PaperTradingSystem:
         if self.positions[symbol] > 0 and self.stop_losses[symbol] > 0:
             if current_price <= self.stop_losses[symbol]:
                 # Stop loss triggered - sell everything
-                gain_loss = (current_price - self.stop_losses[symbol] / (1 - stop_loss_percent)) * self.positions[symbol]
                 trade_value = self.positions[symbol] * current_price
+                
+                # Calculate fees for selling
+                entry_price = self.stop_losses[symbol] / (1 - stop_loss_percent)  # Calculate back the entry price
+                sell_fees = fee_calculator.calculate_net_profit(
+                    entry_price=entry_price,
+                    exit_price=current_price,
+                    quantity=self.positions[symbol],
+                    trade_type="INTRADAY"
+                )
+                
+                # Adjust balance with fees deducted
+                self.balance += trade_value - sell_fees["total_charges"]
+                
+                # Record actual gain/loss including fees
+                gain_loss = sell_fees["net_pnl"]
                 
                 self.monitor.send_notification(
                     subject=f"Stop Loss Triggered - {symbol}",
-                    message=f"Stop loss triggered for {symbol} at {current_price:.2f}\n"
-                           f"Sold {self.positions[symbol]:.2f} shares for {trade_value:.2f}\n"
-                           f"Gain/Loss: {gain_loss:.2f} ({gain_loss/trade_value*100:.2f}%)"
+                    message=f"""
+                    <html>
+                    <body>
+                    <h3>Stop Loss Triggered for {symbol}</h3>
+                    <table border="1" cellpadding="5">
+                        <tr><td>Sell Price</td><td>₹{current_price:.2f}</td></tr>
+                        <tr><td>Quantity</td><td>{self.positions[symbol]:.2f} shares</td></tr>
+                        <tr><td>Trade Value</td><td>₹{trade_value:.2f}</td></tr>
+                        <tr><td>Trading Fees</td><td>₹{sell_fees['total_charges']:.2f}</td></tr>
+                        <tr><td>Net P&L</td><td>₹{gain_loss:.2f} ({sell_fees['net_pnl_percent']:.2f}%)</td></tr>
+                    </table>
+                    </body>
+                    </html>
+                    """
                 )
                 
-                self.balance += trade_value
                 print(f"⚠️ STOP LOSS TRIGGERED for {symbol} at {current_price:.2f}! Sold {self.positions[symbol]:.2f} shares for {trade_value:.2f}")
-                print(f"Gain/Loss: {gain_loss:.2f} ({gain_loss/trade_value*100:.2f}%)")
+                print(f"Trading Fees: ₹{sell_fees['total_charges']:.2f}")
+                print(f"Net Gain/Loss: ₹{gain_loss:.2f} ({sell_fees['net_pnl_percent']:.2f}%)")
                 
-                # Record trade
+                # Record trade with fees
                 self.trade_history.append({
                     'timestamp': datetime.datetime.now(),
                     'symbol': symbol,
@@ -710,7 +912,8 @@ class PaperTradingSystem:
                     'price': current_price,
                     'quantity': self.positions[symbol],
                     'value': trade_value,
-                    'gain_loss': gain_loss
+                    'fees': sell_fees['total_charges'],
+                    'net_pnl': gain_loss
                 })
                 
                 # Reset position
@@ -725,29 +928,50 @@ class PaperTradingSystem:
                 # Calculate trade size
                 max_trade_value = self.balance * 0.2  
                 trade_value = max_trade_value * buy_fraction
-                shares_to_buy = trade_value / current_price
+                
+                # Calculate fees and adjust shares to buy
+                estimated_fees = fee_calculator.calculate_total_charges(trade_value, "INTRADAY")
+                adjusted_trade_value = trade_value - estimated_fees["total_charges"]
+                shares_to_buy = adjusted_trade_value / current_price
                 
                 if shares_to_buy > 0:
                     actual_cost = shares_to_buy * current_price
-                    self.balance -= actual_cost
+                    total_cost = actual_cost + estimated_fees["total_charges"]
+                    self.balance -= total_cost
                     self.positions[symbol] += shares_to_buy
+                    
+                    # Calculate breakeven price
+                    breakeven = fee_calculator.calculate_breakeven(current_price, shares_to_buy, "INTRADAY")
                     
                     self.monitor.send_notification(
                         subject=f"New Position - {symbol}",
-                        message=f"New position opened for {symbol}\n"
-                               f"Shares bought: {shares_to_buy:.2f}\n"
-                               f"Price: {current_price:.2f}\n"
-                               f"Total cost: {actual_cost:.2f}\n"
-                               f"Stop loss set at {self.stop_losses[symbol]:.2f}"
+                        message=f"""
+                        <html>
+                        <body>
+                        <h3>New Position Opened for {symbol}</h3>
+                        <table border="1" cellpadding="5">
+                            <tr><td>Entry Price</td><td>₹{current_price:.2f}</td></tr>
+                            <tr><td>Quantity</td><td>{shares_to_buy:.2f} shares</td></tr>
+                            <tr><td>Trade Value</td><td>₹{actual_cost:.2f}</td></tr>
+                            <tr><td>Trading Fees</td><td>₹{estimated_fees['total_charges']:.2f}</td></tr>
+                            <tr><td>Total Cost</td><td>₹{total_cost:.2f}</td></tr>
+                            <tr><td>Breakeven Price</td><td>₹{breakeven:.2f}</td></tr>
+                            <tr><td>Stop Loss Price</td><td>₹{current_price * (1 - stop_loss_percent):.2f}</td></tr>
+                        </table>
+                        </body>
+                        </html>
+                        """
                     )
                     
                     # Set stop-loss
                     self.stop_losses[symbol] = current_price * (1 - stop_loss_percent)
                     
-                    print(f"🛒 BUY {symbol}: {shares_to_buy:.2f} shares at {current_price:.2f} = {actual_cost:.2f}")
-                    print(f"Stop loss set at {self.stop_losses[symbol]:.2f} ({stop_loss_percent*100:.1f}% below)")
+                    print(f"🛒 BUY {symbol}: {shares_to_buy:.2f} shares at {current_price:.2f} = ₹{actual_cost:.2f}")
+                    print(f"Trading Fees: ₹{estimated_fees['total_charges']:.2f}")
+                    print(f"Breakeven Price: ₹{breakeven:.2f}")
+                    print(f"Stop loss set at ₹{self.stop_losses[symbol]:.2f} ({stop_loss_percent*100:.1f}% below)")
                     
-                    # Record trade
+                    # Record trade with fees
                     self.trade_history.append({
                         'timestamp': datetime.datetime.now(),
                         'symbol': symbol,
@@ -755,6 +979,9 @@ class PaperTradingSystem:
                         'price': current_price,
                         'quantity': shares_to_buy,
                         'value': actual_cost,
+                        'fees': estimated_fees['total_charges'],
+                        'total_cost': total_cost,
+                        'breakeven': breakeven,
                         'stop_loss': self.stop_losses[symbol]
                     })
                     
@@ -765,25 +992,48 @@ class PaperTradingSystem:
             # Model suggests selling
             shares_to_sell = self.positions[symbol]
             sale_value = shares_to_sell * current_price
-            gain_loss = sale_value - (shares_to_sell * (self.stop_losses[symbol] / (1 - stop_loss_percent)))
+            
+            # Calculate original entry price (approximate)
+            entry_price = self.stop_losses[symbol] / (1 - stop_loss_percent)
+            
+            # Calculate fees and net profit
+            sell_result = fee_calculator.calculate_net_profit(
+                entry_price=entry_price,
+                exit_price=current_price,
+                quantity=shares_to_sell,
+                trade_type="INTRADAY"
+            )
+            
+            # Adjust balance with fees deducted
+            self.balance += sale_value - sell_result["total_charges"]
+            net_pnl = sell_result["net_pnl"]
             
             self.monitor.send_notification(
                 subject=f"Position Closed - {symbol}",
-                message=f"Position closed for {symbol}\n"
-                       f"Shares sold: {shares_to_sell:.2f}\n"
-                       f"Price: {current_price:.2f}\n"
-                       f"Total value: {sale_value:.2f}\n"
-                       f"Gain/Loss: {gain_loss:.2f}"
+                message=f"""
+                <html>
+                <body>
+                <h3>Position Closed for {symbol}</h3>
+                <table border="1" cellpadding="5">
+                    <tr><td>Entry Price</td><td>₹{entry_price:.2f}</td></tr>
+                    <tr><td>Exit Price</td><td>₹{current_price:.2f}</td></tr>
+                    <tr><td>Quantity</td><td>{shares_to_sell:.2f} shares</td></tr>
+                    <tr><td>Trade Value</td><td>₹{sale_value:.2f}</td></tr>
+                    <tr><td>Trading Fees</td><td>₹{sell_result['total_charges']:.2f}</td></tr>
+                    <tr><td>Gross P&L</td><td>₹{sell_result['gross_pnl']:.2f} ({sell_result['gross_pnl_percent']:.2f}%)</td></tr>
+                    <tr><td>Net P&L</td><td>₹{net_pnl:.2f} ({sell_result['net_pnl_percent']:.2f}%)</td></tr>
+                </table>
+                </body>
+                </html>
+                """
             )
             
-            self.balance += sale_value
-            self.positions[symbol] = 0.0
-            self.stop_losses[symbol] = 0.0
+            print(f"💰 SELL {symbol}: {shares_to_sell:.2f} shares at {current_price:.2f} = ₹{sale_value:.2f}")
+            print(f"Trading Fees: ₹{sell_result['total_charges']:.2f}")
+            print(f"Gross P&L: ₹{sell_result['gross_pnl']:.2f} ({sell_result['gross_pnl_percent']:.2f}%)")
+            print(f"Net P&L after fees: ₹{net_pnl:.2f} ({sell_result['net_pnl_percent']:.2f}%)")
             
-            print(f"💰 SELL {symbol}: {shares_to_sell:.2f} shares at {current_price:.2f} = {sale_value:.2f}")
-            print(f"Gain/Loss: {gain_loss:.2f}")
-            
-            # Record trade
+            # Record trade with fees
             self.trade_history.append({
                 'timestamp': datetime.datetime.now(),
                 'symbol': symbol,
@@ -791,12 +1041,19 @@ class PaperTradingSystem:
                 'price': current_price,
                 'quantity': shares_to_sell,
                 'value': sale_value,
-                'gain_loss': gain_loss
+                'fees': sell_result['total_charges'],
+                'gross_pnl': sell_result['gross_pnl'],
+                'net_pnl': net_pnl
             })
+            
+            # Reset position
+            self.positions[symbol] = 0.0
+            self.stop_losses[symbol] = 0.0
             
             return True
             
         return False
+
     
     def calculate_portfolio_value(self):
         """Calculate total portfolio value (cash + positions)"""
@@ -852,10 +1109,10 @@ class PaperTradingSystem:
             self.last_summary_time = current_time
     
     def print_portfolio_summary(self):
-        """Print summary of current portfolio status"""
-        print("\n" + "="*50)
+        """Print summary of current portfolio status with tax and fees impact"""
+        print("\n" + "="*60)
         print(f"PORTFOLIO SUMMARY - {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        print("="*50)
+        print("="*60)
         
         # Calculate total value and return
         portfolio_value = self.calculate_portfolio_value()
@@ -864,7 +1121,44 @@ class PaperTradingSystem:
         print(f"Cash Balance: ₹{self.balance:.2f}")
         print(f"Position Value: ₹{portfolio_value - self.balance:.2f}")
         print(f"Total Portfolio Value: ₹{portfolio_value:.2f}")
+        
+        # Calculate fee impact
+        if hasattr(self, 'trade_history') and self.trade_history:
+            total_fees = sum(trade.get('fees', 0) for trade in self.trade_history)
+            total_gross_pnl = sum(trade.get('gross_pnl', 0) for trade in self.trade_history if 'gross_pnl' in trade)
+            total_net_pnl = sum(trade.get('net_pnl', 0) for trade in self.trade_history if 'net_pnl' in trade)
+            
+            fee_impact = 0
+            if total_gross_pnl != 0:
+                fee_impact = (total_fees / abs(total_gross_pnl)) * 100
+            
+            print(f"\nTrading Performance:")
+            print(f"Total Gross P&L: ₹{total_gross_pnl:.2f}")
+            print(f"Total Trading Fees: ₹{total_fees:.2f} ({fee_impact:.2f}% of gross P&L)")
+            print(f"Total Net P&L: ₹{total_net_pnl:.2f}")
+        
         print(f"Total Return: {percent_return:.2f}%")
+        
+        # Calculate tax implications (for annual reporting)
+        # In India, intraday trading is considered non-delivery based and taxed as business income
+        if hasattr(self, 'trade_history') and self.trade_history:
+            # Calculate short-term capital gains for completed trades (simplified)
+            # For actual tax calculation, would need to track financial year and tax brackets
+            net_profit = total_net_pnl if 'total_net_pnl' in locals() else sum(trade.get('net_pnl', 0) for trade in self.trade_history if 'net_pnl' in trade)
+            
+            # Simplified tax calculation (assuming business income)
+            # In reality, this depends on income tax bracket, but using 30% as example
+            estimated_tax = 0
+            if net_profit > 0:
+                estimated_tax = net_profit * 0.30  # 30% income tax rate (simplified)
+                
+            # Show after-tax return
+            after_tax_profit = net_profit - estimated_tax if net_profit > 0 else net_profit
+            
+            print(f"\nTax Implications (Simplified):")
+            print(f"Net Trading Profit (Pre-tax): ₹{net_profit:.2f}")
+            print(f"Estimated Income Tax (30%): ₹{estimated_tax:.2f}")
+            print(f"Net Profit After Tax: ₹{after_tax_profit:.2f}")
         
         # Calculate time elapsed
         elapsed_time = datetime.datetime.now() - self.start_time
@@ -873,13 +1167,19 @@ class PaperTradingSystem:
         # Calculate annualized return
         if elapsed_days > 0:
             annualized_return = ((1 + percent_return/100) ** (365/elapsed_days) - 1) * 100
-            print(f"Annualized Return: {annualized_return:.2f}%")
+            print(f"\nAnnualized Return (Pre-tax): {annualized_return:.2f}%")
+            
+            # After-tax annualized return (simplified)
+            if 'after_tax_profit' in locals():
+                after_tax_return = (after_tax_profit / self.initial_capital) * 100
+                after_tax_annualized = ((1 + after_tax_return/100) ** (365/elapsed_days) - 1) * 100
+                print(f"Annualized Return (After-tax): {after_tax_annualized:.2f}%")
         
-        # Show positions
+        # Show positions with current status
         print("\nCurrent Positions:")
-        print("-"*50)
-        print(f"{'Symbol':<10} {'Shares':<10} {'Price':<10} {'Value':<15} {'Stop Loss':<10}")
-        print("-"*50)
+        print("-"*60)
+        print(f"{'Symbol':<10} {'Shares':<10} {'Price':<10} {'Value':<15} {'Stop Loss':<10} {'Breakeven':<10}")
+        print("-"*60)
         
         for symbol in self.positions:
             if self.positions[symbol] > 0:
@@ -887,23 +1187,108 @@ class PaperTradingSystem:
                 if price is not None:
                     value = self.positions[symbol] * price
                     stop_loss = self.stop_losses[symbol]
-                    print(f"{symbol:<10} {self.positions[symbol]:<10.2f} {price:<10.2f} {value:<15.2f} {stop_loss:<10.2f}")
+                    
+                    # Find the breakeven price from trade history
+                    breakeven = 0
+                    for trade in reversed(self.trade_history):
+                        if trade['symbol'] == symbol and trade['action'] == 'BUY' and 'breakeven' in trade:
+                            breakeven = trade['breakeven']
+                            break
+                    
+                    print(f"{symbol:<10} {self.positions[symbol]:<10.2f} {price:<10.2f} {value:<15.2f} {stop_loss:<10.2f} {breakeven:<10.2f}")
         
-        print("="*50 + "\n")
-    
+        print("="*60 + "\n")
+
+
     def save_trading_history(self):
-        """Save trading history to CSV file"""
+        """Save trading history to CSV file with tax and fee calculations"""
         if self.trade_history:
+            # Enhanced trade history with more columns
             df = pd.DataFrame(self.trade_history)
             df.to_csv("paper_trading_history.csv", index=False)
             print("Trading history saved to paper_trading_history.csv")
+            
+            # Create a tax and fee summary report
+            tax_report = []
+            
+            # Group trades by symbol
+            symbols = set(trade['symbol'] for trade in self.trade_history)
+            
+            for symbol in symbols:
+                symbol_trades = [t for t in self.trade_history if t['symbol'] == symbol]
+                
+                # Calculate metrics
+                total_buy_value = sum(t['value'] for t in symbol_trades if t['action'] == 'BUY')
+                total_sell_value = sum(t['value'] for t in symbol_trades if t['action'] in ['SELL', 'STOP LOSS SELL'])
+                total_fees = sum(t.get('fees', 0) for t in symbol_trades)
+                total_gross_pnl = sum(t.get('gross_pnl', 0) for t in symbol_trades if 'gross_pnl' in t)
+                total_net_pnl = sum(t.get('net_pnl', 0) for t in symbol_trades if 'net_pnl' in t)
+                
+                # Add to report
+                tax_report.append({
+                    'symbol': symbol,
+                    'total_buy_value': total_buy_value,
+                    'total_sell_value': total_sell_value,
+                    'total_fees': total_fees,
+                    'total_gross_pnl': total_gross_pnl,
+                    'total_net_pnl': total_net_pnl,
+                    'fee_impact_percent': (total_fees / abs(total_gross_pnl) * 100) if total_gross_pnl != 0 else 0,
+                    'estimated_tax': total_net_pnl * 0.30 if total_net_pnl > 0 else 0,  # Simplified 30% tax
+                    'after_tax_profit': total_net_pnl * 0.70 if total_net_pnl > 0 else total_net_pnl  # After tax profit
+                })
+            
+            # Save tax report
+            tax_df = pd.DataFrame(tax_report)
+            tax_df.to_csv("trading_tax_report.csv", index=False)
+            print("Tax and fee report saved to trading_tax_report.csv")
+            
+            # Generate a daily P&L report
+            if self.trade_history:
+                # Convert timestamps to date strings
+                for trade in self.trade_history:
+                    if isinstance(trade['timestamp'], datetime.datetime):
+                        trade['date'] = trade['timestamp'].strftime('%Y-%m-%d')
+                    else:
+                        trade['date'] = str(trade['timestamp']).split(' ')[0]
+                
+                # Group by date
+                daily_pnl = {}
+                for trade in self.trade_history:
+                    date = trade['date']
+                    if date not in daily_pnl:
+                        daily_pnl[date] = {
+                            'date': date,
+                            'gross_pnl': 0,
+                            'fees': 0,
+                            'net_pnl': 0,
+                            'trades': 0
+                        }
+                    
+                    daily_pnl[date]['trades'] += 1
+                    daily_pnl[date]['fees'] += trade.get('fees', 0)
+                    
+                    if 'gross_pnl' in trade:
+                        daily_pnl[date]['gross_pnl'] += trade['gross_pnl']
+                    
+                    if 'net_pnl' in trade:
+                        daily_pnl[date]['net_pnl'] += trade['net_pnl']
+                
+                # Convert to dataframe and save
+                daily_df = pd.DataFrame(list(daily_pnl.values()))
+                if not daily_df.empty:
+                    # Calculate tax and after-tax profit
+                    daily_df['estimated_tax'] = daily_df['net_pnl'].apply(lambda x: x * 0.30 if x > 0 else 0)
+                    daily_df['after_tax_profit'] = daily_df['net_pnl'] - daily_df['estimated_tax']
+                    
+                    daily_df.to_csv("daily_trading_pnl.csv", index=False)
+                    print("Daily P&L report saved to daily_trading_pnl.csv")
         
         # Also save portfolio history
         if self.portfolio_history:
             df = pd.DataFrame(self.portfolio_history)
             df.to_csv("portfolio_value_history.csv", index=False)
             print("Portfolio history saved to portfolio_value_history.csv")
-    
+                
     def plot_portfolio_performance(self):
         """Plot portfolio performance over time"""
         if len(self.portfolio_history) < 2:
@@ -956,9 +1341,16 @@ class AutomatedLiveTradingSystem(PaperTradingSystem):
         self._setup_logging()
         
         # Track market hours
-        self.market_open = datetime.time(9, 30)  # 9:30 AM
-        self.market_close = datetime.time(16, 0)  # 4:00 PM
-        self.market_timezone = datetime.timezone(datetime.timedelta(hours=-4))  # EST/EDT
+        self.market_open = datetime.time(9, 15)  # NSE/BSE Open Time
+        self.market_close = datetime.time(15, 30)  # NSE/BSE Close Time
+        self.market_timezone = datetime.timezone(datetime.timedelta(hours=5, minutes=30))  # IST (UTC+5:30)
+        self.ist = pytz.timezone('Asia/Kolkata')
+
+        # Optional: add some known Indian market holidays (YYYY-MM-DD)
+        self.holidays = {
+            '2025-01-26', '2025-03-29', '2025-08-15', '2025-10-02', '2025-11-12'
+            # You can add more from NSE/BSE official holiday list
+        }
         
         self.log("Automated live trading system initialized")
     
@@ -987,19 +1379,30 @@ class AutomatedLiveTradingSystem(PaperTradingSystem):
     
     def is_market_open(self):
         """Check if the market is currently open"""
-        now = datetime.datetime.now(self.market_timezone)
-        current_time = now.time()
-        current_day = now.weekday()
-        
-        # Check if weekend (5 = Saturday, 6 = Sunday)
-        if current_day >= 5:
+
+        now_ist = datetime.datetime.now(self.ist)
+        self.log(f"now_ist -----------{now_ist}")
+        today_str = now_ist.strftime('%Y-%m-%d')
+        self.log(f"today_str ==========={today_str}")
+
+        if now_ist.weekday() >= 5:  # Saturday or Sunday
+            self.log(f"Market closed on weekends.")
+            return False, "Market closed on weekends."
+
+        if today_str in self.holidays:
+            self.log(f"Market holiday on {today_str}.")
             return False
-        
-        # Check if within market hours
-        if self.market_open <= current_time <= self.market_close:
+
+        market_open_dt = datetime.datetime.combine(now_ist.date(), self.market_open, tzinfo=self.ist)
+        market_close_dt = datetime.datetime.combine(now_ist.date(), self.market_close, tzinfo=self.ist)
+
+        if market_open_dt <= now_ist <= market_close_dt:
+            self.log(f"Market is OPEN (Current IST: {now_ist.strftime('%H:%M:%S')})")
             return True
-        
-        return False
+        else:
+            self.log(f"Market is CLOSED (Current IST: {now_ist.strftime('%H:%M:%S')})")
+            return False
+
     
     def wait_for_next_cycle(self, interval_minutes=5):
         """Wait until the next trading cycle should run"""
@@ -1100,6 +1503,8 @@ def train_model(symbol, start_date, end_date, timesteps=50000, model_dir="models
         print(f"Action shape: {action.shape}")
         obs, reward, done, _, info = env.step(action)
         print(f"Resulting observation shape: {obs.shape}")
+
+        print(f"Staring for stock=====: {symbol}")
         
         # Define policy with custom feature extractor
         policy_kwargs = dict(
@@ -1134,13 +1539,73 @@ def train_model(symbol, start_date, end_date, timesteps=50000, model_dir="models
         print(f"Error training model for {symbol}: {e}")
         return None
 
-def backtest_model(symbol, model, start_date, end_date):
-    """Backtest a trained model on historical data"""
-    try:
-        print(f"Backtesting model for {symbol}...")
+# def backtest_model(symbol, model, start_date, end_date):
+#     """Backtest a trained model on historical data"""
+#     try:
+#         print(f"Backtesting model for {symbol}...")
         
-        # Create test environment with different date range
+#         # Create test environment with different date range
+#         env = StockTradingEnv(symbol=symbol, start_date=start_date, end_date=end_date)
+        
+#         # Run backtest
+#         obs, info = env.reset()
+#         done = False
+#         total_reward = 0
+        
+#         while not done:
+#             action, _states = model.predict(obs, deterministic=True)
+#             obs, reward, done, _, info = env.step(action)
+#             total_reward += reward
+        
+#         # Calculate performance metrics
+#         initial_balance = 10000.0  # Environment's initial balance
+#         final_net_worth = info['net_worth']
+#         percent_return = (final_net_worth - initial_balance) / initial_balance * 100
+        
+#         print(f"Backtest Results for {symbol}:")
+#         print(f"Initial Balance: ₹{initial_balance:.2f}")
+#         print(f"Final Net Worth: ₹{final_net_worth:.2f}")
+#         print(f"Return: {percent_return:.2f}%")
+#         print(f"Total Reward: {total_reward:.2f}")
+        
+#         return {
+#             'symbol': symbol,
+#             'initial_balance': initial_balance,
+#             'final_net_worth': final_net_worth,
+#             'percent_return': percent_return,
+#             'total_reward': total_reward
+#         }
+        
+#     except Exception as e:
+#         print(f"Error backtesting model for {symbol}: {e}")
+#         return None
+
+def backtest_model(symbol, model, start_date, end_date):
+    """Backtest a trained model on historical data with Zerodha trading fees"""
+    try:
+        print(f"Backtesting model for {symbol} with Zerodha fees...")
+        
+        # Create test environment
         env = StockTradingEnv(symbol=symbol, start_date=start_date, end_date=end_date)
+        fee_calculator = TradingFees()  # Uses Zerodha fees
+        
+        # Initialize all fee tracking variables
+        fee_components = {
+            'total': 0.0,
+            'brokerage': 0.0,
+            'stt': 0.0,
+            'exchange_charges': 0.0,
+            'gst': 0.0,
+            'sebi_charges': 0.0,
+            'stamp_duty': 0.0
+        }
+        
+        # Trade tracking
+        total_trades = 0
+        winning_trades = 0
+        trade_history = []
+        entry_price = 0.0
+        entry_step = 0
         
         # Run backtest
         obs, info = env.reset()
@@ -1149,38 +1614,122 @@ def backtest_model(symbol, model, start_date, end_date):
         
         while not done:
             action, _states = model.predict(obs, deterministic=True)
+            buy_fraction, stop_loss_percent = action
+            current_price = env.df.iloc[env.current_step]['close']
+            
+            # Check for position exit (including stop loss)
+            if env.position > 0 and (current_price <= env.stop_loss or buy_fraction < 0.1):
+                # Calculate fees for selling
+                sell_result = fee_calculator.calculate_net_profit(
+                    entry_price=entry_price,
+                    exit_price=current_price,
+                    quantity=env.position,
+                    trade_type="INTRADAY"
+                )
+                
+                # Update fee components
+                for fee_type in fee_components:
+                    if fee_type in sell_result:
+                        fee_components[fee_type] += sell_result[fee_type]
+                
+                # Record trade
+                trade_history.append({
+                    'entry_step': entry_step,
+                    'exit_step': env.current_step,
+                    'entry_price': entry_price,
+                    'exit_price': current_price,
+                    'quantity': env.position,
+                    'pnl': sell_result['net_pnl'],
+                    'fees': sell_result['total_charges'],
+                    'return_pct': sell_result['net_pnl_percent']
+                })
+                
+                total_trades += 1
+                if sell_result['net_pnl'] > 0:
+                    winning_trades += 1
+                
+                # Reset entry price
+                entry_price = 0.0
+            
+            # Execute action
             obs, reward, done, _, info = env.step(action)
             total_reward += reward
+            
+            # Check for new position entry
+            if buy_fraction > 0.2 and env.position > 0 and entry_price == 0:
+                entry_price = current_price
+                entry_step = env.current_step
         
         # Calculate performance metrics
-        initial_balance = 10000.0  # Environment's initial balance
+        initial_balance = env.initial_balance
         final_net_worth = info['net_worth']
+        gross_return = (final_net_worth - initial_balance) / initial_balance * 100
+        net_return_after_fees = gross_return - (fee_components['total'] / initial_balance * 100)
+        win_rate = (winning_trades / total_trades * 100) if total_trades > 0 else 0
         percent_return = (final_net_worth - initial_balance) / initial_balance * 100
         
-        print(f"Backtest Results for {symbol}:")
+        # Print results with Zerodha fee breakdown
+        print(f"\n=== Backtest Results for {symbol} (Zerodha Fees) ===")
+        print(f"\nPerformance Metrics:")
         print(f"Initial Balance: ₹{initial_balance:.2f}")
         print(f"Final Net Worth: ₹{final_net_worth:.2f}")
-        print(f"Return: {percent_return:.2f}%")
+        print(f"Gross Return: {gross_return:.2f}%")
+        print(f"Net Return After Fees: {net_return_after_fees:.2f}%")
         print(f"Total Reward: {total_reward:.2f}")
+        
+        print(f"\nTrade Statistics:")
+        print(f"Total Trades: {total_trades}")
+        print(f"Winning Trades: {winning_trades} ({win_rate:.1f}%)")
+        
+        print(f"\nZerodha Fee Breakdown:")
+        print(f"Total Fees: ₹{fee_components['total']:.2f}")
+        print(f" - STT: ₹{fee_components['stt']:.2f} (0.025% on sell side)")
+        print(f" - Exchange Charges: ₹{fee_components['exchange_charges']:.2f} (0.00325%)")
+        print(f" - GST: ₹{fee_components['gst']:.2f} (18% on exchange charges)")
+        print(f" - SEBI Charges: ₹{fee_components['sebi_charges']:.2f} (₹10 per crore)")
+        print(f" - Stamp Duty: ₹{fee_components['stamp_duty']:.2f} (0.003% on buy)")
+        print("Note: Brokerage is ₹0 for equity trades on Zerodha")
+        
+        # Save detailed trade history
+        if trade_history:
+            
+            # Create directory if it doesn't exist
+            os.makedirs("backtest_trades", exist_ok=True)
+            file_path = os.path.join("backtest_trades", f"trades_{symbol}.csv")
+
+            df = pd.DataFrame(trade_history)
+            df['symbol'] = symbol
+            
+            df.to_csv(file_path, index=False)
+            print(f"\nDetailed trade history saved to backtest_trades_{symbol}.csv")
         
         return {
             'symbol': symbol,
             'initial_balance': initial_balance,
             'final_net_worth': final_net_worth,
-            'percent_return': percent_return,
-            'total_reward': total_reward
+            'gross_return': gross_return,
+            'fee_breakdown': fee_components,
+            'net_return': net_return_after_fees,
+            'total_trades': total_trades,
+            'win_rate': win_rate,
+            'percent_return' : percent_return,
+            'total_reward': total_reward,
+            'trade_history': trade_history
         }
         
     except Exception as e:
         print(f"Error backtesting model for {symbol}: {e}")
         return None
-
+    
 def main():
     """Main function to run the trading system"""
     # Configuration
-    # symbols = ["ABB", "ADANIENSOL", "ADANIENT", "ADANIGREEN", "ADANIPORTS", "ADANIPOWER", "AMBUJACEM", "APOLLOHOSP", "ASIANPAINT", "DMART", "AXISBANK","BAJAJ-AUTO", "BAJFINANCE", "BAJAJFINSV","BAJAJHLDNG", "BAJAJHFL", "BANKBARODA", "BEL", "BPCL", "BHARTIARTL", "BOSCHLTD", "BRITANNIA","CGPOWER", "CANBK", "CHOLAFIN", "CIPLA", "COALINDIA", "DLF", "DABUR", "DIVISLAB", "DRREDDY", "EICHERMOT", "ETERNAL", "GAIL", "GODREJCP", "GRASIM", "HCLTECH", "HDFCBANK","HDFCLIFE", "HAVELLS", "HEROMOTOCO", "HINDALCO", "HAL", "HINDUNILVR", "HYUNDAI", "ICICIBANK","ICICIGI", "ICICIPRULI", "ITC", "INDHOTEL", "IOC", "IRFC", "INDUSINDBK", "NAUKRI", "INFY","INDIGO", "JSWENERGY", "JSWSTEEL", "JINDALSTEL", "JIOFIN", "KOTAKBANK", "LTIM", "LT", "LICI","LODHA", "M&M", "MARUTI", "NTPC", "NESTLEIND", "ONGC", "PIDILITIND", "PFC", "POWERGRID", "PNB", "RECLTD", "RELIANCE", "SBILIFE", "MOTHERSON", "SHREECEM", "SHRIRAMFIN", "SIEMENS", "SBIN", "SUNPHARMA", "SWIGGY", "TVSMOTOR", "TCS", "TATACONSUM", "TATAMOTORS", "TATAPOWER", "TATASTEEL", "TECHM", "TITAN", "TORNTPHARM", "TRENT", "ULTRACEMCO", "UNITDSPR", "VBL", "VEDL", "WIPRO", "ZYDUSLIFE"]
+    # symbols = get_best_scalping_stocks()
 
-    symbols = ["HDFCBANK", "ICICIBANK"]
+    # print(f"Below are the symbols for scalping")
+    # print(symbols)
+
+    symbols = ["ABB", "ADANIENSOL", "ADANIENT", "ADANIGREEN", "ADANIPORTS", "ADANIPOWER", "AMBUJACEM", "APOLLOHOSP", "ASIANPAINT"]
     
     training_start = '2025-04-08'
     training_end = '2025-04-16'

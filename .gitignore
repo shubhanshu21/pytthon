@@ -1,0 +1,87 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdk/
+venv/
+ENV/
+env/
+venv/
+.env/
+.venv/
+env.bak/
+venv.bak/
+pip-log.txt
+pip-delete-this-directory.txt
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*.sublime-workspace
+*.sublime-project
+
+# Data files
+*.csv
+*.pkl
+*.h5
+*.feather
+*.parquet
+*.json
+*.xlsx
+*.db
+*.sqlite
+*.npy
+*.npz
+
+# Model files
+models/*.zip
+models/*.pth
+models/*.h5
+models/*.onnx
+models/*.pt
+
+# Logs and outputs
+logs/
+*.log
+*.out
+*.ipynb_checkpoints
+output/
+backtest_trades/
+paper_trading_history.csv
+trading_tax_report.csv
+daily_trading_pnl.csv
+portfolio_value_history.csv
+portfolio_performance.png
+
+# Environment files
+*.env
+*.local
+.env.local
+.env.development
+.env.test
+.env.production
+
+# Jupyter Notebook
+.ipynb_checkpoints/
+*.ipynb
+
+# System files
+.DS_Store
+Thumbs.db
