@@ -1,0 +1,14 @@
+
+[Unit]
+Description=AI Stock Trading System
+After=network.target
+
+[Service]
+User=root
+WorkingDirectory=/var/www/html/python
+ExecStart=/usr/bin/python3 /var/www/html/python/paper.py --autorun
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
