@@ -63,7 +63,8 @@ logs/
 *.out
 *.ipynb_checkpoints
 output/
-backtest_trades/
+backtest_trades/*
+datasets/*
 paper_trading_history.csv
 trading_tax_report.csv
 daily_trading_pnl.csv

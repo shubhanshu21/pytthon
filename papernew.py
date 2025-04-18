@@ -17,9 +17,7 @@ from stable_baselines3.common.policies import ActorCriticPolicy
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 import logging
 import sys
-import datetime
 import argparse
-import os
 from dotenv import load_dotenv
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
@@ -27,9 +25,57 @@ import smtplib
 from typing import Dict, Any
 import pytz
 from scalping_stocks_finder import get_best_scalping_stocks
+from stable_baselines3.common.callbacks import BaseCallback
 
 # Load environment variables
 load_dotenv()
+
+class TrainingMonitor(BaseCallback):
+    def __init__(self, verbose=0):
+        super().__init__(verbose)
+        self.actions = []
+        self.rewards = []
+        self.step_counter = 0
+        self.env = None
+    
+    def _on_training_start(self):
+        self.env = self.training_env.envs[0]
+    
+    def _on_step(self):
+        # Store last action and reward every 1000 steps
+        if self.step_counter % 1000 == 0:
+            if hasattr(self.env, 'last_action') and self.env.last_action is not None:
+                self.actions.append(self.env.last_action)
+            
+            if 'rewards' in self.locals and len(self.locals['rewards']) > 0:
+                self.rewards.append(self.locals['rewards'][0])
+            
+            if len(self.actions) > 0 and len(self.rewards) > 0:
+                print(f"Step {self.step_counter}: Action={self.actions[-1]}, Reward={self.rewards[-1]}")
+        
+        self.step_counter += 1
+        return True
+    
+    def plot_training_progress(self):
+        # Plot actions and rewards over time
+        import matplotlib.pyplot as plt
+        plt.figure(figsize=(12, 8))
+        
+        if self.actions:
+            plt.subplot(2, 1, 1)
+            plt.plot([a[0] for a in self.actions], label='Buy Fraction')
+            plt.plot([a[1] for a in self.actions], label='Stop Loss')
+            plt.legend()
+            plt.title('Actions Over Training')
+        
+        if self.rewards:
+            plt.subplot(2, 1, 2)
+            plt.plot(self.rewards)
+            plt.title('Rewards Over Training')
+        
+        plt.tight_layout()
+        plt.savefig('training_progress.png')
+        plt.close()
 
 class TradingFees:
     """
@@ -353,20 +399,51 @@ def parse_arguments():
     return parser.parse_args()
 
 class StockTradingEnv(gym.Env):
-    def __init__(self, symbol, start_date, end_date, timeframe='1m'):
+    def __init__(self, symbol, start_date, end_date, timeframe='1m',min_holding_period=5,position_held_steps = 0):
         super(StockTradingEnv, self).__init__()
         
-        self.symbol = symbol+'.NS'
+        # self.symbol = symbol+'.NS'
+        self.symbol = symbol
         self.start_date = start_date
         self.end_date = end_date
         self.timeframe = timeframe
-        
+        self.metadata = {'render.modes': ['human'], 'render_fps': 60}
+        self.render_mode = None
+        self.min_holding_period = 5  # Minimum steps to hold a position
+        self.position_held_steps = 0  # Counter for how long position has been held
+
         # Download stock data using yfinance
         print(f"Downloading data for {symbol} from {start_date} to {end_date}...")
         try:
-            self.df = yf.download(self.symbol, start=self.start_date, end=self.end_date, interval=self.timeframe)
-            print(f"Downloaded {len(self.df)} rows of data")
+            # self.df = yf.download(self.symbol, start=self.start_date, end=self.end_date, interval=self.timeframe)
+            # print(f"Downloaded {len(self.df)} rows of data")
             
+            filename = f"datasets/{symbol}_minute.csv"
+
+            if not os.path.exists(filename):
+                raise FileNotFoundError(f"{filename} not found. Please generate it or download using yfinance.")
+
+            # Read CSV into DataFrame
+            self.df = pd.read_csv(filename)
+
+            # ADD THIS VALIDATION CODE HERE
+            print(f"Data statistics for {symbol}:")
+            print(f"Close price range: {self.df['close'].min()} to {self.df['close'].max()}")
+            print(f"Sample values: {self.df['close'].head().tolist()}")
+
+            # Ensure data is not improperly scaled
+            if self.df['close'].max() < 1.0:
+                print("WARNING: Close prices seem to be improperly scaled or normalized!")
+                # If you confirm this is a scaling issue, you can uncomment this fix:
+                # self.df['close'] = self.df['close'] * 100  # Example scaling adjustment
+
+            self.df.drop(columns=['date'], inplace=True)
+
+            print(f"Head data for {symbol}")
+
+            # Show first 5 rows
+            print(self.df.head())
+
             # Check if we have enough data
             if len(self.df) < 50:  # Minimum data needed for indicators
                 raise ValueError(f"Not enough data available for {symbol} in the given date range.")
@@ -388,7 +465,7 @@ class StockTradingEnv(gym.Env):
             
             # Fill NaN values
             self.df = self.df.ffill().bfill()
-            self.df.fillna(0, inplace=True)  # Replace any remaining NaNs with 0
+            self.df.bfill(inplace=True)
             
             # Clip extreme values to prevent issues with scaling
             for col in self.df.columns:
@@ -398,7 +475,9 @@ class StockTradingEnv(gym.Env):
                     self.df[col] = self.df[col].clip(q_low, q_high)
             
             # Define features and ensure they exist
-            self.feature_columns = ['open', 'high', 'low', 'close', 'volume', 'rsi', 'atr', 'ma20', 'ma50', 'macd', 'signal', 'vwap', 'obv']
+            self.feature_columns = ['close', 'rsi', 'atr', 'ema8', 'ema21', 'macd', 'signal', 'ma20', 'ma50',
+                        'bb_upper', 'bb_lower', 'vwap', 'obv', 'obv_ema', 'momentum', 'cci',
+                        'price_change', 'volume_change', 'volatility', 'is_bullish_engulfing']
             self.feature_columns = [col for col in self.feature_columns if col in self.df.columns]
             
             # Make sure all columns have valid data types
@@ -432,26 +511,32 @@ class StockTradingEnv(gym.Env):
                 'close': [99.0] * 100,
                 'low': [98.0] * 100,
                 'volume': [1000.0] * 100,
-                'rsi':[1000.0] * 100,
-                'atr':[1000.0] * 100,
-                'ma20':[1000.0] * 100,
-                'ma50':[1000.0] * 100,
-                'macd':[1000.0] * 100,
-                'signal':[1000.0] * 100,
-                'vwap':[1000.0] * 100,
-                'obv':[1000.0] * 100
+                'rsi': [50.0] * 100,        # Default RSI as 50 (neutral)
+                'atr': [1.0] * 100,         # Default ATR as 1.0
+                'ma20': [99.0] * 100,       # Simple moving average (close price)
+                'ma50': [99.0] * 100,       # Simple moving average (close price)
+                'macd': [0.0] * 100,        # Default MACD value (no momentum)
+                'signal': [0.0] * 100,      # Default MACD signal value
+                'vwap': [99.0] * 100,       # Use the close price as default VWAP
+                'obv': [1000.0] * 100,      # Default OBV (should be calculated properly)
+                'obv_ema': [1000.0] * 100,  # Default EMA on OBV
+                'momentum': [0.0] * 100,    # Momentum is zero if not calculated
+                'cci': [0.0] * 100,         # CCI default (neutral)
+                'price_change': [0.0] * 100, # Price change is zero
+                'volume_change': [0.0] * 100, # Volume change is zero
+                'volatility': [0.0] * 100,  # Volatility is zero
+                'is_bullish_engulfing': [0] * 100  # No candlestick pattern by default
             })
-            self.feature_columns = ['open', 'high', 'low', 'close', 'volume', 'rsi', 'atr', 'ma20', 'ma50', 'macd', 'signal', 'vwap', 'obv']
+            
+        self.feature_columns = ['close', 'rsi', 'atr', 'ema8', 'ema21', 'macd', 'signal', 'ma20', 'ma50',
+                        'bb_upper', 'bb_lower', 'vwap', 'obv', 'obv_ema', 'momentum', 'cci',
+                        'price_change', 'volume_change', 'volatility', 'is_bullish_engulfing']
         
         # Action space: Continuous actions [buy_fraction, stop_loss_percent]
         self.action_space = spaces.Box(low=np.array([0.0, 0.0]), high=np.array([1.0, 1.0]), dtype=np.float32)
         
         # Observation space with strictly float32 type
-        self.observation_space = spaces.Box(
-            low=0, high=1, 
-            shape=(len(self.feature_columns),), 
-            dtype=np.float32
-        )
+        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(len(self.feature_columns),), dtype=np.float32)
         
         # Initialize variables
         self.current_step = 0
@@ -463,38 +548,100 @@ class StockTradingEnv(gym.Env):
         self.done = False
         self.reward_range = (-1000, 1000)
         self.stop_loss = 0.0  # Track stop-loss for each trade
-        
+
+
+    def render(self):
+        print(f"Step: {self.current_step}, Net Worth: {self.net_worth:.2f}, Balance: {self.balance:.2f}, Position: {self.position:.2f}")
+    
+
     def _add_technical_indicators(self):
         try:
-            self.df['rsi'] = TA.RSI(self.df, period=14)
-            self.df['atr'] = TA.ATR(self.df, period=14)
-            self.df['ma20'] = TA.SMA(self.df, period=20)
-            self.df['ma50'] = TA.SMA(self.df, period=50)
+            # Basic Indicators (Shorter periods for scalping)
+            self.df['rsi'] = TA.RSI(self.df, period=7)
+            self.df['atr'] = TA.ATR(self.df, period=7)
+            self.df['ema8'] = TA.EMA(self.df, period=8)
+            self.df['ema21'] = TA.EMA(self.df, period=21)
             
+            # MACD
             macd_data = TA.MACD(self.df)
             self.df['macd'] = macd_data['MACD']
             self.df['signal'] = macd_data['SIGNAL']
-            
-            # Calculate VWAP (Volume-Weighted Average Price)
-            self.df['vwap'] = (self.df['volume'] * (self.df['high'] + self.df['low'] + self.df['close']) / 3).cumsum() / self.df['volume'].cumsum()
 
-            # Calculate OBV (On-Balance Volume)
+            # SMA (still useful for longer context)
+            self.df['ma20'] = TA.SMA(self.df, period=20)
+            self.df['ma50'] = TA.SMA(self.df, period=50)
+            
+            # Bollinger Bands
+            bbands = TA.BBANDS(self.df)
+            self.df['bb_upper'] = bbands['BB_UPPER']
+            self.df['bb_lower'] = bbands['BB_LOWER']
+            
+            # VWAP
+            typical_price = (self.df['high'] + self.df['low'] + self.df['close']) / 3
+            self.df['vwap'] = (self.df['volume'] * typical_price).cumsum() / self.df['volume'].cumsum()
+            
+            # OBV + EMA on OBV
             self.df['obv'] = self.df.apply(lambda row: row['volume'] if row['close'] > row['open'] else -row['volume'], axis=1).cumsum()
-
-            # Apply EMA to OBV column
             self.df['obv_ema'] = TA.EMA(self.df, column='obv', period=20)
-            
+
+            # Price and volume change
+            self.df['price_change'] = self.df['close'].pct_change() * 100
+            self.df['volume_change'] = self.df['volume'].pct_change() * 100
+            self.df['volatility'] = self.df['high'] - self.df['low']
+
+            # Momentum and CCI
+            self.df['momentum'] = self.df['close'] - self.df['close'].shift(5)
+            self.df['cci'] = TA.CCI(self.df, period=14)
+
+            # Simple bullish engulfing pattern (candlestick pattern)
+            self.df['is_bullish_engulfing'] = (
+                (self.df['open'].shift(1) > self.df['close'].shift(1)) &
+                (self.df['open'] < self.df['close']) &
+                (self.df['open'] < self.df['close'].shift(1)) &
+                (self.df['close'] > self.df['open'].shift(1))
+            ).astype(int)
+
+            self.df['is_breakout'] = ((self.df['close'] > self.df['bb_upper']) & (self.df['volume_change'] > 30)).astype(int)
+
+            # Handle infinite or NaN values
+            self.df.replace([np.inf, -np.inf], np.nan, inplace=True)  # Replace infinity with NaN
+            self.df.bfill(inplace=True)
+
+            # Normalize selected features
+            from sklearn.preprocessing import MinMaxScaler
+            scaler = MinMaxScaler()
+            to_scale = ['rsi', 'atr', 'macd', 'signal', 'obv', 'obv_ema', 
+                        'momentum', 'cci', 'price_change', 'volume_change', 'volatility']
+            self.df[to_scale] = scaler.fit_transform(self.df[to_scale])
+
+            # Final cleanup
+            self.df.bfill(inplace=True)
+            self.df.dropna(inplace=True)
+
         except Exception as e:
             print(f"Error calculating indicators for {self.symbol}: {e}")
-            # Create basic indicators to ensure consistent columns
+            # Fallback to dummy values
             self.df['rsi'] = 50.0
             self.df['atr'] = 1.0
-            self.df['ma20'] = self.df['close']
-            self.df['ma50'] = self.df['close']
+            self.df['ema8'] = self.df['close']
+            self.df['ema21'] = self.df['close']
             self.df['macd'] = 0.0
             self.df['signal'] = 0.0
+            self.df['ma20'] = self.df['close']
+            self.df['ma50'] = self.df['close']
+            self.df['bb_upper'] = self.df['close']
+            self.df['bb_lower'] = self.df['close']
             self.df['vwap'] = self.df['close']
             self.df['obv'] = self.df['volume']
+            self.df['obv_ema'] = self.df['volume']
+            self.df['price_change'] = 0.0
+            self.df['volume_change'] = 0.0
+            self.df['volatility'] = 0.0
+            self.df['momentum'] = 0.0
+            self.df['cci'] = 0.0
+            self.df['is_bullish_engulfing'] = 0
+
+
 
     def reset(self, *, seed=None, options=None):
         # Updated reset method to match new Gymnasium API
@@ -538,91 +685,151 @@ class StockTradingEnv(gym.Env):
             # Return safe default observation
             return np.zeros(len(self.feature_columns), dtype=np.float32)
 
+    
+    # Update this portion of your step() method in StockTradingEnv class
     def step(self, action):
-        if self.done:
-            return self._get_obs(), 0.0, self.done, False, {}
-        
+        # Store the action for debugging/monitoring purposes
+        self.last_action = action.copy() if hasattr(action, 'copy') else action
+
+        # Check if done or at end of data
+        if self.done or self.current_step >= len(self.df) - 1:
+            self.done = True
+            return self._get_obs(), 0.0, self.done, False, {
+                'net_worth': float(self.net_worth),
+                'balance': float(self.balance),
+                'position': float(self.position),
+                'step': int(self.current_step),
+                'stop_loss': float(self.stop_loss)
+            }
+
         # Safely get current price
         try:
             current_price = float(self.df.iloc[self.current_step]['close'])
         except (IndexError, KeyError) as e:
             print(f"Error getting price for {self.symbol}: {e}")
             current_price = 0.0
-        
+
         prev_net_worth = self.net_worth
-        
-        # Record state before action for reward calculation
         prev_position = self.position
         prev_balance = self.balance
-        
-        # Execute action with proper error handling
+
+        # Execute action with clearer buy/sell logic
         try:
             buy_fraction, stop_loss_percent = action
             buy_fraction = np.clip(buy_fraction, 0.0, 1.0)
             stop_loss_percent = np.clip(stop_loss_percent, 0.0, 1.0)
-            
-            if buy_fraction > 0.0:  # Buy
+
+            # IMPORTANT CHANGE: More explicit buy/sell conditions
+            if buy_fraction > 0.1:  # Only buy if fraction is significant (>10%)
                 if self.balance > 0:
                     max_shares = self.balance / current_price if current_price > 0 else 0
                     shares_bought = buy_fraction * max_shares
-                    self.position += shares_bought
-                    self.balance -= shares_bought * current_price
-                    # Set stop-loss for this trade
-                    self.stop_loss = current_price * (1 - stop_loss_percent)
-            elif buy_fraction == 0.0 and self.position > 0:  # Sell
-                # Check if stop-loss is triggered
-                if current_price <= self.stop_loss:
-                    self.balance += self.position * current_price
-                    self.position = 0.0
-                    self.stop_loss = 0.0
-                else:
-                    # Optional: Implement other sell conditions
-                    pass
-            # Hold if no action is taken
+                    cost = shares_bought * current_price
+                    
+                    if cost > 0:
+                        print(f"BUYING: {shares_bought:.2f} shares at {current_price:.2f}, cost: {cost:.2f}")
+                        self.position += shares_bought
+                        self.balance -= cost
+                        self.stop_loss = current_price * (1 - max(0.05, stop_loss_percent))  # Minimum 5% stop-loss
+                        print(f"New position: {self.position:.2f}, Balance: {self.balance:.2f}, Stop loss: {self.stop_loss:.4f}")
             
+            # Check for sell conditions (either model says sell OR stop loss hit)
+            if self.position > 0:
+                self.position_held_steps += 1
+
+                should_sell = (buy_fraction < 0.1 or current_price <= self.stop_loss) and self.position_held_steps >= self.min_holding_period
+
+                
+                if should_sell:
+                    proceeds = self.position * current_price
+                    print(f"SELLING: {self.position:.2f} shares at {current_price:.2f}, proceeds: {proceeds:.2f}")
+                    print(f"Sell reason: {'Stop-loss triggered' if current_price <= self.stop_loss else 'Model decision'}")
+                    self.balance += proceeds
+                    self.position = 0.0
+                    # self.stop_loss = 0.0
+                    self.stop_loss = current_price * (1 - max(0.05, stop_loss_percent))  # Minimum 5% stop-loss
+                    print(f"New position: {self.position:.2f}, Balance: {self.balance:.2f}")
+                    self.position_held_steps = 0  # Reset counter
+
+                else:
+                    # If trying to sell but haven't held long enough
+                    if buy_fraction < 0.1 or current_price <= self.stop_loss:
+                        print(f"Wanted to sell but holding period ({self.position_held_steps}/{self.min_holding_period}) not met")    
+
+            else:
+                # Reset counter when no position
+                self.position_held_steps = 0
+
         except Exception as e:
             print(f"Error executing action for {self.symbol}: {e}")
-        
+
         # Move to next step
         self.current_step += 1
-        
-        # Calculate values with error handling
+
+        # Recalculate net worth
         try:
             if self.current_step < len(self.df):
                 current_price = float(self.df.iloc[self.current_step]['close'])
-                
+
             self.net_worth = self.balance + (self.position * current_price)
             self.max_net_worth = max(self.max_net_worth, self.net_worth)
         except Exception as e:
             print(f"Error calculating net worth for {self.symbol}: {e}")
-        
-        # Check if done
-        self.done = self.current_step >= len(self.df) - 1
-        
-        # Calculate reward with safe operations
+
+
+        # Reward calculation 
         try:
-            current_return = (self.net_worth - prev_net_worth) / prev_net_worth if prev_net_worth != 0 else 0.0
-            volatility = self.df['close'].pct_change().std() * np.sqrt(252)  # Annualized volatility
-            sharpe_ratio = current_return / volatility if volatility != 0 else 0.0
+            # Calculate raw return
+            pct_change = (self.net_worth - prev_net_worth) / prev_net_worth if prev_net_worth > 0 else 0
             
-            # Penalty for excessive trading
-            trade_penalty = 0.0005  # 0.05% trading fee/penalty
-            if (buy_fraction > 0.0 and prev_balance > 0) or (self.position > 0 and current_price <= self.stop_loss):
-                reward = sharpe_ratio - trade_penalty
-            else:
-                reward = sharpe_ratio
+            # Base reward on actual return, not just Sharpe ratio
+            reward = pct_change * 100  # Scale up percentage change
             
-            # Clip reward to prevent numerical issues
-            reward = np.clip(reward, -1.0, 1.0)
-            reward = float(reward)  # Ensure it's a Python float
+            # Add trading signals to encourage action
+            # 1. Reward for buying when oversold (RSI < 30)
+            rsi = self.df.iloc[self.current_step]['rsi'] 
+            price_change = self.df.iloc[self.current_step]['price_change']
+            
+            # Encourage buying at appropriate times
+            if buy_fraction > 0.1 and prev_position == 0:  # When entering position
+                # Extra reward for buying when oversold
+                if rsi < 0.3:  # RSI < 30%
+                    reward += 0.3  # Increased from 0.2
+                # Reduced penalty for buying when overbought
+                elif rsi > 0.7:  # RSI > 70%
+                    reward -= 0.1  # Reduced from 0.2
+            
+            # Encourage selling at appropriate times
+            if buy_fraction < 0.1 and self.position > 0:  # When exiting position
+                # Extra reward for selling when overbought
+                if rsi > 0.7:  # RSI > 70%
+                    reward += 0.3  # Increased from 0.2
+                # Reduced penalty for selling when oversold
+                elif rsi < 0.3:  # RSI < 30%
+                    reward -= 0.1  # Reduced from 0.2
+            
+            # Add incentive for taking positions (combat do-nothing strategy)
+            if self.position > 0:
+                reward += 0.05  # Small positive reward for holding positions
+            
+            # Trading cost penalty (smaller than before)
+            trading_cost = 0.0001  # Reduced from 0.0002
+            if (buy_fraction > 0.1 and prev_position == 0) or (buy_fraction < 0.1 and self.position == 0 and prev_position > 0):
+                reward -= trading_cost
+            
+            # Stronger penalty for staying in cash too long
+            if prev_position == 0 and self.position == 0:
+                reward -= 0.001  # Increased from 0.0001
+            
+            # Clip reward to reasonable range
+            reward = np.clip(reward, -2.0, 2.0)
+            
         except Exception as e:
-            print(f"Error calculating reward for {self.symbol}: {e}")
+            print(f"Error calculating reward: {e}")
             reward = 0.0
-        
-        # Get observation with safety checks
+
+        # Get observation and info
         obs = self._get_obs()
-        
-        # Return with updated Gymnasium API
         info = {
             'net_worth': float(self.net_worth),
             'balance': float(self.balance),
@@ -630,13 +837,17 @@ class StockTradingEnv(gym.Env):
             'step': int(self.current_step),
             'stop_loss': float(self.stop_loss)
         }
-        
+
+        # Check end condition
+        if self.current_step >= len(self.df) - 1:
+            self.done = True
+
         return obs, reward, self.done, False, info
 
 class LiveMarketDataHandler:
     """Handles fetching and processing real-time market data for paper trading"""
     
-    def __init__(self, symbols, lookback_days=60, update_interval=60):
+    def __init__(self, symbols, lookback_days=6, update_interval=60):
         """
         Initialize the live data handler
         
@@ -650,74 +861,101 @@ class LiveMarketDataHandler:
         self.update_interval = update_interval
         self.data_cache = {}
         self.last_update = {}
-        
+
+
     def get_data(self, symbol):
         """
-        Get current and historical data for a symbol
+        Get current and historical 1-min data for a symbol with technical indicators.
         
         Args:
             symbol: Stock symbol
             
         Returns:
-            DataFrame with stock data
+            DataFrame with enriched stock data
         """
-        current_time = time.time()
+        import yfinance as yf
+        import datetime
+        import time
+        from sklearn.preprocessing import MinMaxScaler
         
+        current_time = time.time()
+
         # Check if we need to update the data
         if symbol not in self.last_update or (current_time - self.last_update[symbol]) > self.update_interval:
             try:
-                # Calculate lookback period
                 end_date = datetime.datetime.now()
                 start_date = end_date - datetime.timedelta(days=self.lookback_days)
-                
-                # Download data
-                print(f"Updating live data for {symbol}...")
+
+                print(f"Fetching 1-min data for {symbol} from {start_date} to {end_date}...")
                 df = yf.download(symbol, start=start_date, end=end_date, interval="1m")
-                
-                if len(df) < 30:  # Need minimum data for indicators
-                    print(f"Warning: Limited data available for {symbol}")
-                
-                # Process column names
-                if isinstance(df.columns[0], tuple):
-                    df.columns = [col[0].lower() if isinstance(col, tuple) else col.lower() for col in df.columns]
-                else:
-                    df.columns = [col.lower() for col in df.columns]
-                
-                # Add technical indicators
-                df['rsi'] = TA.RSI(df, period=14)
-                df['atr'] = TA.ATR(df, period=14)
+
+                if df.empty or len(df) < 30:
+                    print(f"Warning: Not enough data for {symbol}")
+                    return None
+
+                df.columns = [col[0].lower() if isinstance(col, tuple) else col.lower() for col in df.columns]
+
+                # Technical Indicators
+                df['rsi'] = TA.RSI(df, period=7)
+                df['atr'] = TA.ATR(df, period=7)
+                df['ema8'] = TA.EMA(df, period=8)
+                df['ema21'] = TA.EMA(df, period=21)
                 df['ma20'] = TA.SMA(df, period=20)
                 df['ma50'] = TA.SMA(df, period=50)
-                
-                macd_data = TA.MACD(df)
-                df['macd'] = macd_data['MACD']
-                df['signal'] = macd_data['SIGNAL']
-                
-                # Calculate VWAP and OBV
+
+                macd = TA.MACD(df)
+                df['macd'] = macd['MACD']
+                df['signal'] = macd['SIGNAL']
+
+                bbands = TA.BBANDS(df)
+                df['bb_upper'] = bbands['BB_UPPER']
+                df['bb_lower'] = bbands['BB_LOWER']
+
                 df['vwap'] = (df['volume'] * (df['high'] + df['low'] + df['close']) / 3).cumsum() / df['volume'].cumsum()
                 df['obv'] = df.apply(lambda row: row['volume'] if row['close'] > row['open'] else -row['volume'], axis=1).cumsum()
-                
-                # Handle NaN values
-                df = df.ffill().bfill()
-                df.fillna(0, inplace=True)
-                
-                # Update cache
+                df['obv_ema'] = TA.EMA(df, column='obv', period=20)
+
+                # Additional Features
+                df['momentum'] = df['close'] - df['close'].shift(5)
+                df['cci'] = TA.CCI(df, period=14)
+                df['price_change'] = df['close'].pct_change() * 100
+                df['volume_change'] = df['volume'].pct_change() * 100
+                df['volatility'] = df['high'] - df['low']
+
+                # Candlestick Pattern: Bullish Engulfing
+                df['is_bullish_engulfing'] = (
+                    (df['open'].shift(1) > df['close'].shift(1)) &
+                    (df['open'] < df['close']) &
+                    (df['open'] < df['close'].shift(1)) &
+                    (df['close'] > df['open'].shift(1))
+                ).astype(int)
+
+                # Normalize selected columns
+                scaler = MinMaxScaler()
+                norm_cols = ['rsi', 'atr', 'macd', 'signal', 'obv', 'obv_ema', 
+                            'momentum', 'cci', 'price_change', 'volume_change', 'volatility']
+                df[norm_cols] = scaler.fit_transform(df[norm_cols])
+
+                self.df.bfill(inplace=True)
+                df.dropna(inplace=True)
+
+                # Cache data
                 self.data_cache[symbol] = df
                 self.last_update[symbol] = current_time
-                
-                print(f"Data updated for {symbol}, most recent price: {df['close'].iloc[-1]:.2f}")
-                
+
+                print(f"Data updated for {symbol}, last price: {df['close'].iloc[-1]:.2f}")
+
             except Exception as e:
-                print(f"Error fetching live data for {symbol}: {e}")
-                # Return cached data if available
+                print(f"Error fetching data for {symbol}: {e}")
                 if symbol in self.data_cache:
                     print(f"Using cached data for {symbol}")
                     return self.data_cache[symbol]
                 else:
-                    print(f"No data available for {symbol}")
+                    print(f"No cached data available for {symbol}")
                     return None
-        
+
         return self.data_cache[symbol]
+
     
     def get_latest_price(self, symbol):
         """Get the latest price for a symbol"""
@@ -964,7 +1202,7 @@ class PaperTradingSystem:
                     )
                     
                     # Set stop-loss
-                    self.stop_losses[symbol] = current_price * (1 - stop_loss_percent)
+                    self.stop_loss = current_price * (1 - max(0.05, stop_loss_percent))  # Minimum 5% stop-loss
                     
                     print(f"🛒 BUY {symbol}: {shares_to_buy:.2f} shares at {current_price:.2f} = ₹{actual_cost:.2f}")
                     print(f"Trading Fees: ₹{estimated_fees['total_charges']:.2f}")
@@ -1090,7 +1328,10 @@ class PaperTradingSystem:
                     continue
                 
                 # Get latest features
-                feature_columns = ['open', 'high', 'low', 'close', 'volume', 'rsi', 'atr', 'ma20', 'ma50', 'macd', 'signal', 'vwap', 'obv']
+                feature_columns = ['close', 'rsi', 'atr', 'ema8', 'ema21', 'macd', 'signal', 'ma20', 'ma50',
+                        'bb_upper', 'bb_lower', 'vwap', 'obv', 'obv_ema', 'momentum', 'cci',
+                        'price_change', 'volume_change', 'volatility', 'is_bullish_engulfing']
+                
                 observation = self.data_handler.get_latest_features(symbol, feature_columns)
                 
                 # Get model action
@@ -1483,113 +1724,93 @@ class AutomatedLiveTradingSystem(PaperTradingSystem):
 
 
 def train_model(symbol, start_date, end_date, timesteps=50000, model_dir="models"):
-    """Train a RL model for stock trading"""
+    """
+    Train a PPO RL model for stock trading using custom features and save it to disk.
+
+    Parameters:
+        symbol (str): Stock symbol (e.g., 'TCS.NS')
+        start_date (str): Training start date (e.g., '2020-01-01')
+        end_date (str): Training end date (e.g., '2024-12-31')
+        timesteps (int): Number of training steps
+        model_dir (str): Directory to save the trained model
+
+    Returns:
+        model (PPO): Trained PPO model, or None if training fails
+    """
     try:
-        print(f"Training model for {symbol}...")
+        print(f"🚀 Training model for {timesteps:,} timesteps...")
+        # Create and use the training monitor
+        monitor = TrainingMonitor(verbose=1)
+        model.learn(total_timesteps=timesteps, callback=monitor)
+
+        # Plot training progress
+        monitor.plot_training_progress()
+
+        print(f"\n🔧 Starting training for: {symbol}")
         
-        # Create environment
+        # Initialize custom environment
         env = StockTradingEnv(symbol=symbol, start_date=start_date, end_date=end_date)
 
-        # Debug: Check observation and action spaces
+        # Debug: Inspect environment spaces
         print(f"Observation space: {env.observation_space}")
         print(f"Action space: {env.action_space}")
 
-         # Test one step to verify shapes
-        obs, info = env.reset()
-        print(f"Observation shape: {obs.shape}")
-        
-        # Test a random action
-        action = env.action_space.sample()
-        print(f"Action shape: {action.shape}")
-        obs, reward, done, _, info = env.step(action)
-        print(f"Resulting observation shape: {obs.shape}")
+        # Quick check: Take a random action
+        obs, _ = env.reset()
+        print(f"Initial observation shape: {obs.shape}")
+        random_action = env.action_space.sample()
+        print(f"Sample action: {random_action}")
+        obs, reward, done, _, _ = env.step(random_action)
+        print(f"Observation after one step: {obs.shape}, Reward: {reward:.2f}")
 
-        print(f"Staring for stock=====: {symbol}")
-        
-        # Define policy with custom feature extractor
+        # Custom feature extractor for improved learning
         policy_kwargs = dict(
             features_extractor_class=CustomFeaturesExtractor,
             features_extractor_kwargs=dict(features_dim=128),
         )
-        
-        # Create model
-        model = PPO("MlpPolicy", 
-                    env, 
-                    policy_kwargs=policy_kwargs,
-                    verbose=1, 
-                    learning_rate=0.0001,
-                    batch_size=64,
-                    n_steps=2048,
-                    ent_coef=0.01,
-                    gamma=0.99)
-        
-        # Train model
+
+        # Create PPO model
+        model = PPO(
+            policy="MlpPolicy",
+            env=env,
+            policy_kwargs=policy_kwargs,
+            verbose=1,
+            learning_rate=5e-4,  # Increased from 1e-4
+            batch_size=128,      # Increased from 64
+            n_steps=1024,        # Reduced from 2048 for more frequent updates
+            ent_coef=0.05,       # Increased from 0.01 to encourage exploration
+            gamma=0.99,
+            # Add clip range to prevent extreme policy changes
+            clip_range=0.2
+        )
+
+        print(f"🚀 Training model for {timesteps:,} timesteps...")
         model.learn(total_timesteps=timesteps)
         
-        # Save model
+        # Save the model
         os.makedirs(model_dir, exist_ok=True)
-        clean_symbol = symbol.split('.')[0]  # Remove .NS or other suffixes
-        model_path = f"{model_dir}/ppo_{clean_symbol}"
+        clean_symbol = symbol.replace(".", "_")
+        model_path = os.path.join(model_dir, f"ppo_{clean_symbol}")
         model.save(model_path)
-        
-        print(f"Model for {symbol} trained and saved to {model_path}")
+
+        print(f"✅ Model saved to: {model_path}")
         return model
-        
+
     except Exception as e:
-        print(f"Error training model for {symbol}: {e}")
+        print(f"❌ Error training model for {symbol}: {e}")
         return None
 
-# def backtest_model(symbol, model, start_date, end_date):
-#     """Backtest a trained model on historical data"""
-#     try:
-#         print(f"Backtesting model for {symbol}...")
-        
-#         # Create test environment with different date range
-#         env = StockTradingEnv(symbol=symbol, start_date=start_date, end_date=end_date)
-        
-#         # Run backtest
-#         obs, info = env.reset()
-#         done = False
-#         total_reward = 0
-        
-#         while not done:
-#             action, _states = model.predict(obs, deterministic=True)
-#             obs, reward, done, _, info = env.step(action)
-#             total_reward += reward
-        
-#         # Calculate performance metrics
-#         initial_balance = 10000.0  # Environment's initial balance
-#         final_net_worth = info['net_worth']
-#         percent_return = (final_net_worth - initial_balance) / initial_balance * 100
-        
-#         print(f"Backtest Results for {symbol}:")
-#         print(f"Initial Balance: ₹{initial_balance:.2f}")
-#         print(f"Final Net Worth: ₹{final_net_worth:.2f}")
-#         print(f"Return: {percent_return:.2f}%")
-#         print(f"Total Reward: {total_reward:.2f}")
-        
-#         return {
-#             'symbol': symbol,
-#             'initial_balance': initial_balance,
-#             'final_net_worth': final_net_worth,
-#             'percent_return': percent_return,
-#             'total_reward': total_reward
-#         }
-        
-#     except Exception as e:
-#         print(f"Error backtesting model for {symbol}: {e}")
-#         return None
 
 def backtest_model(symbol, model, start_date, end_date):
     """Backtest a trained model on historical data with Zerodha trading fees"""
     try:
         print(f"Backtesting model for {symbol} with Zerodha fees...")
-        
+
         # Create test environment
         env = StockTradingEnv(symbol=symbol, start_date=start_date, end_date=end_date)
-        fee_calculator = TradingFees()  # Uses Zerodha fees
-        
-        # Initialize all fee tracking variables
+        fee_calculator = TradingFees()  # Zerodha fee model
+
+        # Initialize fee tracking
         fee_components = {
             'total': 0.0,
             'brokerage': 0.0,
@@ -1599,76 +1820,128 @@ def backtest_model(symbol, model, start_date, end_date):
             'sebi_charges': 0.0,
             'stamp_duty': 0.0
         }
-        
-        # Trade tracking
+
         total_trades = 0
         winning_trades = 0
         trade_history = []
         entry_price = 0.0
         entry_step = 0
-        
-        # Run backtest
+
         obs, info = env.reset()
         done = False
+        truncated = False
         total_reward = 0
+        slippage = 0.001  # 0.1% slippage
         
-        while not done:
-            action, _states = model.predict(obs, deterministic=True)
-            buy_fraction, stop_loss_percent = action
-            current_price = env.df.iloc[env.current_step]['close']
+        # Add maximum steps to prevent infinite loops
+        max_steps = len(env.df)
+        step_count = 0
+
+        while not (done or truncated) and step_count < max_steps:
+            step_count += 1
             
-            # Check for position exit (including stop loss)
-            if env.position > 0 and (current_price <= env.stop_loss or buy_fraction < 0.1):
-                # Calculate fees for selling
-                sell_result = fee_calculator.calculate_net_profit(
-                    entry_price=entry_price,
-                    exit_price=current_price,
-                    quantity=env.position,
-                    trade_type="INTRADAY"
-                )
+            try:
+                action, _states = model.predict(obs, deterministic=True)
+                buy_fraction, stop_loss_percent = action
+                current_price = env.df.iloc[env.current_step]['close']
                 
-                # Update fee components
-                for fee_type in fee_components:
-                    if fee_type in sell_result:
-                        fee_components[fee_type] += sell_result[fee_type]
+                # Debug information
+                print(f"Step {env.current_step}/{max_steps}, Position: {env.position}, "
+                      f"Price: {current_price:.2f}, Action: Buy={buy_fraction:.4f}, SL={stop_loss_percent:.4f}")
                 
-                # Record trade
-                trade_history.append({
-                    'entry_step': entry_step,
-                    'exit_step': env.current_step,
-                    'entry_price': entry_price,
-                    'exit_price': current_price,
-                    'quantity': env.position,
-                    'pnl': sell_result['net_pnl'],
-                    'fees': sell_result['total_charges'],
-                    'return_pct': sell_result['net_pnl_percent']
-                })
+                # ENTER POSITION: Only try to enter if buy_fraction is significant
+                if env.position == 0 and buy_fraction > 0.1:  # Threshold for buying
+                    entry_price = current_price * (1 + slippage)
+                    entry_step = env.current_step
+                    print(f"ENTER: Step {env.current_step}, Price: {entry_price:.2f}")
                 
-                total_trades += 1
-                if sell_result['net_pnl'] > 0:
-                    winning_trades += 1
-                
-                # Reset entry price
-                entry_price = 0.0
-            
-            # Execute action
-            obs, reward, done, _, info = env.step(action)
+                # EXIT POSITION
+                if env.position > 0 and (current_price <= env.stop_loss or buy_fraction < 0.1):
+                    exit_price = current_price * (1 - slippage)
+                    print(f"EXIT: Step {env.current_step}, Entry: {entry_price:.2f}, Exit: {exit_price:.2f}")
+
+                    sell_result = fee_calculator.calculate_net_profit(
+                        entry_price=entry_price,
+                        exit_price=exit_price,
+                        quantity=env.position,
+                        trade_type="INTRADAY"
+                    )
+
+                    for fee_type in fee_components:
+                        if fee_type in sell_result:
+                            fee_components[fee_type] += sell_result[fee_type]
+
+                    trade_history.append({
+                        'entry_step': entry_step,
+                        'exit_step': env.current_step,
+                        'entry_price': entry_price,
+                        'exit_price': exit_price,
+                        'quantity': env.position,
+                        'pnl': sell_result['net_pnl'],
+                        'fees': sell_result['total_charges'],
+                        'return_pct': sell_result['net_pnl_percent']
+                    })
+
+                    total_trades += 1
+                    if sell_result['net_pnl'] > 0:
+                        winning_trades += 1
+
+                    entry_price = 0.0
+
+            except Exception as e:
+                print(f"Model prediction error at step {env.current_step}: {e}")
+                break
+
+            obs, reward, done, truncated, info = env.step(action)
             total_reward += reward
             
-            # Check for new position entry
-            if buy_fraction > 0.2 and env.position > 0 and entry_price == 0:
-                entry_price = current_price
-                entry_step = env.current_step
-        
-        # Calculate performance metrics
+            # Check if we've reached the end of data
+            if env.current_step >= len(env.df) - 1:
+                print("Reached end of data. Terminating backtest.")
+                break
+
+        print(f"Episode ended. Total steps: {step_count}/{max_steps}. Total reward: {total_reward}")
+
+        # Close final open position
+        if env.position > 0:
+            current_price = env.df.iloc[env.current_step]['close']
+            exit_price = current_price * (1 - slippage)
+            print(f"FINAL EXIT: Step {env.current_step}, Entry: {entry_price:.2f}, Exit: {exit_price:.2f}")
+
+            sell_result = fee_calculator.calculate_net_profit(
+                entry_price=entry_price,
+                exit_price=exit_price,
+                quantity=env.position,
+                trade_type="INTRADAY"
+            )
+
+            for fee_type in fee_components:
+                if fee_type in sell_result:
+                    fee_components[fee_type] += sell_result[fee_type]
+
+            trade_history.append({
+                'entry_step': entry_step,
+                'exit_step': env.current_step,
+                'entry_price': entry_price,
+                'exit_price': exit_price,
+                'quantity': env.position,
+                'pnl': sell_result['net_pnl'],
+                'fees': sell_result['total_charges'],
+                'return_pct': sell_result['net_pnl_percent']
+            })
+
+            total_trades += 1
+            if sell_result['net_pnl'] > 0:
+                winning_trades += 1
+
+        # Metrics
         initial_balance = env.initial_balance
         final_net_worth = info['net_worth']
         gross_return = (final_net_worth - initial_balance) / initial_balance * 100
         net_return_after_fees = gross_return - (fee_components['total'] / initial_balance * 100)
         win_rate = (winning_trades / total_trades * 100) if total_trades > 0 else 0
         percent_return = (final_net_worth - initial_balance) / initial_balance * 100
-        
-        # Print results with Zerodha fee breakdown
+
         print(f"\n=== Backtest Results for {symbol} (Zerodha Fees) ===")
         print(f"\nPerformance Metrics:")
         print(f"Initial Balance: ₹{initial_balance:.2f}")
@@ -1676,11 +1949,11 @@ def backtest_model(symbol, model, start_date, end_date):
         print(f"Gross Return: {gross_return:.2f}%")
         print(f"Net Return After Fees: {net_return_after_fees:.2f}%")
         print(f"Total Reward: {total_reward:.2f}")
-        
+
         print(f"\nTrade Statistics:")
         print(f"Total Trades: {total_trades}")
         print(f"Winning Trades: {winning_trades} ({win_rate:.1f}%)")
-        
+
         print(f"\nZerodha Fee Breakdown:")
         print(f"Total Fees: ₹{fee_components['total']:.2f}")
         print(f" - STT: ₹{fee_components['stt']:.2f} (0.025% on sell side)")
@@ -1689,20 +1962,17 @@ def backtest_model(symbol, model, start_date, end_date):
         print(f" - SEBI Charges: ₹{fee_components['sebi_charges']:.2f} (₹10 per crore)")
         print(f" - Stamp Duty: ₹{fee_components['stamp_duty']:.2f} (0.003% on buy)")
         print("Note: Brokerage is ₹0 for equity trades on Zerodha")
-        
-        # Save detailed trade history
+
         if trade_history:
-            
-            # Create directory if it doesn't exist
+            import os
+            import pandas as pd
             os.makedirs("backtest_trades", exist_ok=True)
             file_path = os.path.join("backtest_trades", f"trades_{symbol}.csv")
-
             df = pd.DataFrame(trade_history)
             df['symbol'] = symbol
-            
             df.to_csv(file_path, index=False)
-            print(f"\nDetailed trade history saved to backtest_trades_{symbol}.csv")
-        
+            print(f"\nDetailed trade history saved to {file_path}")
+
         return {
             'symbol': symbol,
             'initial_balance': initial_balance,
@@ -1712,15 +1982,82 @@ def backtest_model(symbol, model, start_date, end_date):
             'net_return': net_return_after_fees,
             'total_trades': total_trades,
             'win_rate': win_rate,
-            'percent_return' : percent_return,
+            'percent_return': percent_return,
             'total_reward': total_reward,
             'trade_history': trade_history
         }
-        
+
     except Exception as e:
+        import traceback
         print(f"Error backtesting model for {symbol}: {e}")
+        print(traceback.format_exc())
         return None
+
+def curriculum_training(symbol, start_date, end_date, timesteps=50000, model_dir="models"):
+    """
+    Train a model using curriculum learning - starting with easier environment settings
+    and progressively making it harder
+    """
+    print(f"\n🔧 Starting curriculum training for: {symbol}")
     
+    # Create policy kwargs
+    policy_kwargs = dict(
+        features_extractor_class=CustomFeaturesExtractor,
+        features_extractor_kwargs=dict(features_dim=128),
+    )
+    
+    # Start with an easier environment (higher reward for trading)
+    print("Phase 1: Training with easier environment (higher trading incentives)")
+    env_easy = StockTradingEnv(
+        symbol=symbol, 
+        start_date=start_date, 
+        end_date=end_date,
+        min_holding_period=2  # Easier constraint
+    )
+    
+    # Create model with higher exploration
+    model = PPO(
+        policy="MlpPolicy", 
+        env=env_easy, 
+        policy_kwargs=policy_kwargs,
+        verbose=1, 
+        ent_coef=0.1,  # High exploration
+        learning_rate=1e-3,
+        batch_size=128
+    )
+    
+    # Phase 1 training
+    monitor1 = TrainingMonitor(verbose=1)
+    model.learn(total_timesteps=int(timesteps * 0.3), callback=monitor1)
+    monitor1.plot_training_progress()
+    
+    # Progress to standard environment
+    print("Phase 2: Training with standard environment")
+    env_standard = StockTradingEnv(
+        symbol=symbol, 
+        start_date=start_date, 
+        end_date=end_date,
+        min_holding_period=5  # Standard constraint
+    )
+    model.set_env(env_standard)
+    
+    # Phase 2 training with slightly lower exploration
+    model.ent_coef = 0.05
+    model.learning_rate = 5e-4
+    
+    monitor2 = TrainingMonitor(verbose=1)
+    model.learn(total_timesteps=int(timesteps * 0.7), callback=monitor2)
+    monitor2.plot_training_progress()
+    
+    # Save final model
+    os.makedirs(model_dir, exist_ok=True)
+    clean_symbol = symbol.replace(".", "_")
+    model_path = os.path.join(model_dir, f"ppo_{clean_symbol}")
+    model.save(model_path)
+    
+    print(f"✅ Curriculum training complete for {symbol}")
+    return model
+  
 def main():
     """Main function to run the trading system"""
     # Configuration
@@ -1729,12 +2066,12 @@ def main():
     # print(f"Below are the symbols for scalping")
     # print(symbols)
 
-    symbols = ["ABB", "ADANIENSOL", "ADANIENT", "ADANIGREEN", "ADANIPORTS", "ADANIPOWER", "AMBUJACEM", "APOLLOHOSP", "ASIANPAINT"]
+    symbols = ["ABB"]
     
-    training_start = '2025-04-08'
-    training_end = '2025-04-16'
-    test_start = '2025-04-16'
-    test_end = '2025-04-17'
+    training_start = '2015-02-02'
+    training_end = '2023-12-31'
+    test_start = '2024-01-01'
+    test_end = '2025-02-07'
     model_dir = "models"
     
     # Create model directory if it doesn't exist
@@ -1745,14 +2082,16 @@ def main():
         print("\n===== AI STOCK TRADING SYSTEM =====")
         print("1. Train models for all symbols")
         print("2. Train model for specific symbol")
-        print("3. Backtest models")
-        print("4. Run paper trading simulation")
-        print("5. Run automated live trading")
-        print("6. Setup system service")
-        print("7. Exit")
-        
-        choice = input("\nEnter your choice (1-7): ")
-        
+        print("3. Train with curriculum learning (recommended)")  # Add this new option
+        print("4. Backtest models")
+        print("5. Run paper trading simulation")
+        print("6. Run automated live trading")
+        print("7. Setup system service")
+        print("8. Exit")  # Changed from 7 to 8
+
+        choice = input("\nEnter your choice (1-8): ")  # Update range
+
+
         if choice == '1':
             # Train models for all symbols
             for symbol in symbols:
@@ -1763,8 +2102,15 @@ def main():
             symbol = input("Enter stock symbol to train model for: ").upper()
             if symbol:
                 train_model(symbol, training_start, training_end, model_dir=model_dir)
-            
+        # Add the new option handling
         elif choice == '3':
+            # Train using curriculum learning
+            symbol = input("Enter stock symbol for curriculum training: ").upper()
+            if symbol:
+                timesteps = int(input("Enter training timesteps (default: 50000): ") or 50000)
+                curriculum_training(symbol, training_start, training_end, timesteps, model_dir=model_dir)
+
+        elif choice == '4':
             # Backtest models
             results = []
             for symbol in symbols:
@@ -1791,7 +2137,7 @@ def main():
                 for result in sorted(results, key=lambda x: x['percent_return'], reverse=True):
                     print(f"{result['symbol']:<10} {result['percent_return']:<10.2f} ₹{result['final_net_worth']:<15.2f}")
             
-        elif choice == '4':
+        elif choice == '5':
             # Run paper trading simulation (keep existing functionality)
             print("Starting paper trading simulation...")
             paper_trader = PaperTradingSystem(symbols)
@@ -1819,7 +2165,7 @@ def main():
                 paper_trader.save_trading_history()
                 paper_trader.plot_portfolio_performance()
                 
-        elif choice == '5':
+        elif choice == '6':
             # Run automated live trading
             print("\n===== AUTOMATED LIVE TRADING =====")
             print("This will run continuously until stopped (Ctrl+C).")
@@ -1848,12 +2194,12 @@ def main():
                 print("\nStarting automated live trading...")
                 automated_trader.run_forever(cycle_interval_minutes=cycle_interval)
                 
-        elif choice == '6':
+        elif choice == '7':
             # Setup system service
             print("\nSetting up system service for automated trading...")
             setup_system_service()
             
-        elif choice == '7':
+        elif choice == '8':
             print("Exiting program. Goodbye!")
             break
             
@@ -1863,7 +2209,7 @@ def main():
 # Add this at the end of your existing file
 if __name__ == "__main__":
     # Set warnings filter
-    warnings.filterwarnings("ignore", category=FutureWarning)
+    # warnings.filterwarnings("ignore", category=FutureWarning)
     
     # Parse command line arguments
     args = parse_arguments()
